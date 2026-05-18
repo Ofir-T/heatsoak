@@ -4,6 +4,8 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
+import os
+import time
 from collections import deque
 from math import sqrt
 
@@ -124,6 +126,9 @@ class Heatsoak:
         self.min_samples = min(config.getint('min_samples', 5, minval=3), self.window_size)
         self.min_duration = config.getfloat('min_duration', 0.0, minval=0) # allow for hot printers to start quickly
         self.max_duration = config.getfloat('max_duration', 1800, minval=self.min_duration)
+        self.log_path = config.get('log_path', '~/printer_data/logs/heatsoak/')
+        if self.log_path:
+            self.log_path = os.path.expanduser(self.log_path)
 
         self.detector = SteadyStateDetector(self.window_size,self.slope_threshold,
                                             self.residual_threshold, self.min_samples)
@@ -151,38 +156,60 @@ class Heatsoak:
             raise gcmd.error(f'Heater {self.heater_name} has no target temperature, skipping heatsoak')
         gcmd.respond_info(f"heatsoak: starting (target={target:.1f}C min={min_duration:.0f}s max={max_duration:.0f}s)")
 
-        self.detector.reset()
-        reactor = self.printer.get_reactor()
-        start_time = reactor.monotonic()
-        eventtime = start_time
+        csv_file = None
+        try:
+            if self.log_path:
+                os.makedirs(self.log_path, exist_ok=True)
+                filename = os.path.join(self.log_path, f"run_{int(target)}C_{int(time.time())}.csv")
+                csv_file = open(filename, 'w')
+                csv_file.write("elapsed_s,unix_time,temp,target,power,slope,residual_std,sample_count\n")
+                gcmd.respond_info(f"heatsoak: logging to {filename}")
 
-        # wait for heater to "reach" target temp
-        while not self.printer.is_shutdown() and self.heater.check_busy(eventtime):
-            eventtime = reactor.pause(eventtime + 1.)
+            self.detector.reset()
+            reactor = self.printer.get_reactor()
+            start_time = reactor.monotonic()
+            eventtime = start_time
 
-        # perform heatsoak
-        while not self.printer.is_shutdown():
-            eventtime = reactor.pause(eventtime + self.sample_interval) # yield until the next sample window
-            elapsed = eventtime - start_time
-            heater_status = self.heater.get_status(eventtime)
-            power = heater_status['power']
+            # wait for heater to "reach" target temp
+            while not self.printer.is_shutdown() and self.heater.check_busy(eventtime):
+                eventtime = reactor.pause(eventtime + 1.)
 
-            if elapsed > max_duration: # timeout
-                gcmd.respond_info(f"heatsoak: max_duration {max_duration:.0f}s exceeded, proceeding anyway (last power={power:.3f})")
-                return
+            # perform heatsoak
+            while not self.printer.is_shutdown():
+                eventtime = reactor.pause(eventtime + self.sample_interval) # yield until the next sample window
+                elapsed = eventtime - start_time
+                heater_status = self.heater.get_status(eventtime)
+                power = heater_status['power']
 
-            # next sample
-            self.detector.add_sample(eventtime, power)
-            if elapsed >= min_duration and self.detector.is_stable():
-                gcmd.respond_info(f"heatsoak: steady state reached at t={elapsed:.0f}s (power={power:.3f})")
-                return
+                if elapsed > max_duration: # timeout
+                    gcmd.respond_info(f"heatsoak: max_duration {max_duration:.0f}s exceeded, proceeding anyway (last power={power:.3f})")
+                    return
 
-            # progress update
-            det = self.detector.get_status()
-            slope = det['slope'] if det['slope'] is not None else 0.
-            resid = det['residual_std'] if det['residual_std'] is not None else 0.
-            n = det['sample_count']
-            gcmd.respond_info(f"heatsoak: t={elapsed:.0f}s power={power:.3f} slope={slope:.5f} resid={resid:.4f} n={n}")
+                # next sample
+                self.detector.add_sample(eventtime, power)
+                if elapsed >= min_duration and self.detector.is_stable():
+                    gcmd.respond_info(f"heatsoak: steady state reached at t={elapsed:.0f}s (power={power:.3f})")
+                    return
+
+                # progress update
+                det = self.detector.get_status()
+                slope = det['slope'] if det['slope'] is not None else 0.
+                resid = det['residual_std'] if det['residual_std'] is not None else 0.
+                n = det['sample_count']
+                gcmd.respond_info(f"heatsoak: t={elapsed:.0f}s power={power:.3f} slope={slope:.5f} resid={resid:.4f} n={n}")
+
+                # csv log
+                if csv_file is not None:
+                    slope_str = f"{det['slope']:.6f}" if det['slope'] is not None else ""
+                    resid_str = f"{det['residual_std']:.6f}" if det['residual_std'] is not None else ""
+                    csv_file.write(
+                        f"{elapsed:.2f},{time.time():.2f},"
+                        f"{heater_status['temperature']:.2f},{heater_status['target']:.1f},"
+                        f"{power:.4f},{slope_str},{resid_str},{det['sample_count']}\n"
+                    )
+        finally:
+            if csv_file is not None:
+                csv_file.close()
 
 def load_config(config):
     return Heatsoak(config)

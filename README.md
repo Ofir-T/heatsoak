@@ -67,6 +67,7 @@ residual_threshold: 0.02        # max std-dev of residuals around the fit (PWM)
 min_samples: 5                  # samples required before steady-state can be declared
 min_duration: 0                 # minimum wait regardless of detector (sec)
 max_duration: 1800              # hard cap, stops waiting and prints a message (sec)
+log_path: ~/printer_data/logs/heatsoak/    # CSV trace per run; empty to disable
 ```
 
 All fields optional; defaults above. `min_duration: 0` means an already-hot
