@@ -145,6 +145,22 @@ class Heatsoak:
     def _handle_connect(self):
         pheaters = self.printer.lookup_object('heaters')
         self.heater = pheaters.lookup_heater(self.heater_name)
+        # PID controllers expose prev_temp_integ + Ki; bang-bang does not.
+        # When available, Ki * prev_temp_integ is the steady-state component
+        # of the PID output - a much cleaner signal than raw PWM snapshots.
+        self.use_integral = hasattr(self.heater.control, 'prev_temp_integ') \
+                            and hasattr(self.heater.control, 'Ki')
+
+    def _read_signal(self):
+        """Return the value fed to the detector.
+        For PID: Ki * prev_temp_integ (low-pass-filtered effective power).
+        For bang-bang or unknown: raw PWM duty cycle.
+        Read under heater.lock to avoid torn reads during a PID update."""
+        with self.heater.lock:
+            if self.use_integral:
+                ctrl = self.heater.control
+                return ctrl.Ki * ctrl.prev_temp_integ
+            return self.heater.last_pwm_value
 
     cmd_HEATSOAK_WAIT_help = "Wait until heater reaches thermal steady state"
     def cmd_HEATSOAK_WAIT(self, gcmd):
@@ -154,19 +170,25 @@ class Heatsoak:
         target = self.heater.target_temp
         if target <= 0:
             raise gcmd.error(f'Heater {self.heater_name} has no target temperature, skipping heatsoak')
-        gcmd.respond_info(f"heatsoak: starting (target={target:.1f}C min={min_duration:.0f}s max={max_duration:.0f}s)")
+
+        reactor = self.printer.get_reactor()
+        start_status = self.heater.get_status(reactor.monotonic())
+        start_temp = start_status['temperature']
+        signal_source = 'integral' if self.use_integral else 'pwm'
+
+        gcmd.respond_info(f"heatsoak: starting (target={target:.1f}C, start={start_temp:.1f}C, signal={signal_source}, min={min_duration:.0f}s max={max_duration:.0f}s)")
 
         csv_file = None
         try:
             if self.log_path:
                 os.makedirs(self.log_path, exist_ok=True)
-                filename = os.path.join(self.log_path, f"run_{int(target)}C_{int(time.time())}.csv")
+                filename = os.path.join(self.log_path, f"run_{int(start_temp)}Cto{int(target)}C_{int(time.time())}.csv")
                 csv_file = open(filename, 'w')
+                csv_file.write(f"# start_temp={start_temp:.2f},target={target:.1f},signal={signal_source},start_unix={int(time.time())}\n")
                 csv_file.write("elapsed_s,unix_time,temp,target,power,slope,residual_std,sample_count\n")
                 gcmd.respond_info(f"heatsoak: logging to {filename}")
 
             self.detector.reset()
-            reactor = self.printer.get_reactor()
             start_time = reactor.monotonic()
             eventtime = start_time
 
@@ -179,7 +201,7 @@ class Heatsoak:
                 eventtime = reactor.pause(eventtime + self.sample_interval) # yield until the next sample window
                 elapsed = eventtime - start_time
                 heater_status = self.heater.get_status(eventtime)
-                power = heater_status['power']
+                power = self._read_signal()
 
                 if elapsed > max_duration: # timeout
                     gcmd.respond_info(f"heatsoak: max_duration {max_duration:.0f}s exceeded, proceeding anyway (last power={power:.3f})")
