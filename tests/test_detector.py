@@ -3,12 +3,13 @@ from heatsoak import SteadyStateDetector
 
 
 # Default thresholds tight enough that only genuinely flat signals pass.
-def make_detector(min_samples=4):
+# window_size=4 keeps the True-expecting tests below short while still
+# requiring a full window for is_stable() to return True.
+def make_detector(window_size=4):
     return SteadyStateDetector(
-        window_size=10,
+        window_size=window_size,
         slope_threshold=0.001,
         residual_threshold=0.01,
-        min_samples=min_samples,
     )
 
 
@@ -16,7 +17,7 @@ def make_detector(min_samples=4):
 
 def test_window_evicts_old_samples():
     d = SteadyStateDetector(window_size=3, slope_threshold=0.001,
-                            residual_threshold=0.01, min_samples=2)
+                            residual_threshold=0.01)
     for t in range(5):
         d.add_sample(t, 0.1 * t)
     assert len(d.samples) == 3
@@ -41,7 +42,7 @@ def test_linear_decay_not_stable():
 
 
 def test_small_oscillation_with_zero_trend_is_stable():
-    d = make_detector()
+    d = make_detector(window_size=6)
     # Alternating +/-0.005 around 0.105: slope ~0, residual well under 0.01.
     for t, p in [(0, 0.10), (1, 0.11), (2, 0.10), (3, 0.11), (4, 0.10), (5, 0.11)]:
         d.add_sample(t, p)
@@ -57,8 +58,9 @@ def test_large_oscillation_not_stable():
     assert d.is_stable() is False
 
 
-def test_below_min_samples_returns_false():
-    d = make_detector(min_samples=4)
+def test_partial_window_returns_false():
+    # Window not yet full: must return False regardless of how flat the data is.
+    d = make_detector(window_size=4)
     d.add_sample(0, 0.1)
     d.add_sample(1, 0.1)
     assert d.is_stable() is False

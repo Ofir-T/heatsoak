@@ -10,19 +10,18 @@ from collections import deque
 from math import sqrt
 
 class SteadyStateDetector:
-    def __init__(self, window_size, slope_threshold, residual_threshold, min_samples):
+    def __init__(self, window_size, slope_threshold, residual_threshold):
         """
         Initializes the steady-state detector.
 
-        :param window_size: Max samples to keep; older samples drop off the back
+        :param window_size: Number of samples that must fill the window before
+                            is_stable() can return True. Also caps memory.
         :param slope_threshold: Max |slope| (PWM/sec) considered flat
         :param residual_threshold: Max std-dev of residuals around the fitted line
-        :param min_samples: Minimum samples before is_stable() can return True
         """
         self.window_size = window_size
         self.slope_threshold = slope_threshold
         self.residual_threshold = residual_threshold
-        self.min_samples = min_samples
         self.samples = deque(maxlen=window_size)
 
     def add_sample(self, timestamp, power):
@@ -37,11 +36,14 @@ class SteadyStateDetector:
 
     def is_stable(self) -> bool:
         """
-        Return True when the window has at least min_samples and
-        both the fitted slope and the residual std-dev are below their thresholds.
-        False otherwise.
+        Return True when the window is full and both the fitted slope and the
+        residual std-dev are below their thresholds. False otherwise.
+
+        Requiring a full window prevents false positives on partial data: a
+        4-sample regression on a slowly curving signal has too little leverage
+        to distinguish "still settling" from "actually flat".
         """
-        if len(self.samples) < self.min_samples:
+        if len(self.samples) < self.window_size:
             return False
 
         status = self.get_status()
@@ -123,15 +125,14 @@ class Heatsoak:
         self.sample_interval = config.getfloat('sample_interval', 2.0, above=0)
         self.slope_threshold = config.getfloat('slope_threshold', 0.005, above=0)
         self.residual_threshold = config.getfloat('residual_threshold', 0.02, above=0)
-        self.min_samples = min(config.getint('min_samples', 5, minval=3), self.window_size)
         self.min_duration = config.getfloat('min_duration', 0.0, minval=0) # allow for hot printers to start quickly
         self.max_duration = config.getfloat('max_duration', 1800, minval=self.min_duration)
         self.log_path = config.get('log_path', '~/printer_data/logs/heatsoak/')
         if self.log_path:
             self.log_path = os.path.expanduser(self.log_path)
 
-        self.detector = SteadyStateDetector(self.window_size,self.slope_threshold,
-                                            self.residual_threshold, self.min_samples)
+        self.detector = SteadyStateDetector(self.window_size, self.slope_threshold,
+                                            self.residual_threshold)
 
         # find heater after entire config was initialized
         self.heater = None
