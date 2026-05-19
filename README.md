@@ -103,16 +103,46 @@ Console output:
 
 ## Tuning
 
-To tune the thresholds for your printer:
+The defaults are reasonable starting points, but every printer has its own
+thermal characteristics. For best results on your specific machine, use the
+calibration command:
 
-1. Run a print with `HEATSOAK_WAIT MAX_DURATION=300` and watch the console
-   output. The 300-second ceiling lets the command return even if the default
-   thresholds don't yet match your printer.
-2. Record `slope`, `resid`, and `power` after the bed has visibly settled
-   (you can use Mainsail/Fluidd graphs to confirm).
-3. Set `slope_threshold` to ~2x the observed settled slope.
-4. Set `residual_threshold` to ~2x the observed settled residual.
-5. Repeat once or twice if the detector trips too early or too late.
+```gcode
+M140 S60
+M190 S60
+HEATSOAK_CALIBRATE             ; default 20 min observation
+; or:
+HEATSOAK_CALIBRATE DURATION=1800   ; 30 min for slower beds
+```
+
+This runs a long observation **without applying any threshold check** — it
+samples for the full duration regardless of what the signal looks like. At the
+end it analyzes the tail of the trace (presumed steady state) and prints
+recommended threshold values:
+
+```
+// heatsoak calibrate: analyzed tail of 150 samples (last 300s of run)
+// heatsoak calibrate: tail max|slope|=0.000048, max resid=0.0042, avg power=0.165
+// heatsoak calibrate: recommended slope_threshold: 0.00010
+// heatsoak calibrate: recommended residual_threshold: 0.0084
+```
+
+Copy those values into your `[heatsoak]` config block.
+
+The calibration also writes a CSV trace (`cal_<from>Cto<to>C_<unix>.csv`),
+distinguishable from normal run traces. Useful for offline analysis if you
+want to see the full curve.
+
+### Manual tuning (fallback)
+
+If you want to tune without running calibration:
+
+1. Run `HEATSOAK_WAIT MAX_DURATION=300` and watch the console output.
+2. Note the `slope` and `resid` values after the bed has visibly settled
+   (Mainsail/Fluidd graphs help confirm).
+3. Set `slope_threshold` to ~2× the observed settled slope.
+4. Set `residual_threshold` to ~2× the observed settled residual.
+5. Iterate if the detector trips too early or too late.
 
 ## Development
 

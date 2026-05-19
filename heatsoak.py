@@ -138,10 +138,12 @@ class Heatsoak:
         self.heater = None
         self.printer.register_event_handler("klippy:connect", self._handle_connect)
 
-        # register gcode command
+        # register gcode commands
         gcode = self.printer.lookup_object('gcode')
         gcode.register_command('HEATSOAK_WAIT', self.cmd_HEATSOAK_WAIT,
                                desc=self.cmd_HEATSOAK_WAIT_help)
+        gcode.register_command('HEATSOAK_CALIBRATE', self.cmd_HEATSOAK_CALIBRATE,
+                               desc=self.cmd_HEATSOAK_CALIBRATE_help)
 
     def _handle_connect(self):
         pheaters = self.printer.lookup_object('heaters')
@@ -230,6 +232,110 @@ class Heatsoak:
                         f"{heater_status['temperature']:.2f},{heater_status['target']:.1f},"
                         f"{power:.4f},{slope_str},{resid_str},{det['sample_count']}\n"
                     )
+        finally:
+            if csv_file is not None:
+                csv_file.close()
+
+    cmd_HEATSOAK_CALIBRATE_help = (
+        "Observe heater for DURATION seconds to characterize steady state "
+        "and suggest threshold values"
+    )
+    def cmd_HEATSOAK_CALIBRATE(self, gcmd):
+        duration = gcmd.get_float('DURATION', 1200., above=60.)
+
+        target = self.heater.target_temp
+        if target <= 0:
+            raise gcmd.error(f'Heater {self.heater_name} has no target temperature, skipping calibration')
+
+        reactor = self.printer.get_reactor()
+        start_status = self.heater.get_status(reactor.monotonic())
+        start_temp = start_status['temperature']
+        signal_source = 'integral' if self.use_integral else 'pwm'
+
+        gcmd.respond_info(f"heatsoak calibrate: starting (target={target:.1f}C, start={start_temp:.1f}C, signal={signal_source}, duration={duration:.0f}s)")
+
+        records = []  # (elapsed, power, slope, residual_std)
+        csv_file = None
+        try:
+            if self.log_path:
+                os.makedirs(self.log_path, exist_ok=True)
+                filename = os.path.join(self.log_path, f"cal_{int(start_temp)}Cto{int(target)}C_{int(time.time())}.csv")
+                csv_file = open(filename, 'w')
+                csv_file.write(f"# CALIBRATION start_temp={start_temp:.2f},target={target:.1f},signal={signal_source},duration={duration:.0f},start_unix={int(time.time())}\n")
+                csv_file.write("elapsed_s,unix_time,temp,target,power,slope,residual_std,sample_count\n")
+                gcmd.respond_info(f"heatsoak calibrate: logging to {filename}")
+
+            self.detector.reset()
+            start_time = reactor.monotonic()
+            eventtime = start_time
+
+            # wait for heater to reach target temp before starting observation
+            while not self.printer.is_shutdown() and self.heater.check_busy(eventtime):
+                eventtime = reactor.pause(eventtime + 1.)
+
+            # observation loop - runs to duration, no threshold checks
+            while not self.printer.is_shutdown():
+                eventtime = reactor.pause(eventtime + self.sample_interval)
+                elapsed = eventtime - start_time
+                if elapsed > duration:
+                    break
+                heater_status = self.heater.get_status(eventtime)
+                power = self._read_signal()
+                self.detector.add_sample(eventtime, power)
+                det = self.detector.get_status()
+                records.append((elapsed, power, det['slope'], det['residual_std']))
+
+                # progress update
+                slope_disp = f"{det['slope']:.5f}" if det['slope'] is not None else "n/a"
+                resid_disp = f"{det['residual_std']:.4f}" if det['residual_std'] is not None else "n/a"
+                gcmd.respond_info(f"calibrate: t={elapsed:.0f}s power={power:.3f} slope={slope_disp} resid={resid_disp} n={det['sample_count']}")
+
+                # csv log
+                if csv_file is not None:
+                    slope_csv = f"{det['slope']:.6f}" if det['slope'] is not None else ""
+                    resid_csv = f"{det['residual_std']:.6f}" if det['residual_std'] is not None else ""
+                    csv_file.write(
+                        f"{elapsed:.2f},{time.time():.2f},"
+                        f"{heater_status['temperature']:.2f},{heater_status['target']:.1f},"
+                        f"{power:.4f},{slope_csv},{resid_csv},{det['sample_count']}\n"
+                    )
+
+            # analysis: characterize the tail (presumed steady state)
+            if self.printer.is_shutdown() or not records:
+                gcmd.respond_info("heatsoak calibrate: no samples collected, nothing to analyze")
+                return
+
+            total_time = records[-1][0]
+            tail_window_s = max(300., total_time * 0.25)
+            cutoff = total_time - tail_window_s
+            tail = [r for r in records
+                    if r[0] >= cutoff and r[2] is not None and r[3] is not None]
+
+            if len(tail) < 3:
+                gcmd.respond_info("heatsoak calibrate: not enough valid tail samples for analysis")
+                return
+
+            max_slope = max(abs(r[2]) for r in tail)
+            max_resid = max(r[3] for r in tail)
+            avg_power = sum(r[1] for r in tail) / len(tail)
+            rec_slope = max_slope * 2.
+            rec_resid = max_resid * 2.
+
+            if csv_file is not None:
+                csv_file.write(
+                    f"# ANALYSIS tail_samples={len(tail)},tail_window_s={tail_window_s:.0f},"
+                    f"max_abs_slope={max_slope:.6f},max_residual_std={max_resid:.6f},"
+                    f"avg_power={avg_power:.4f},"
+                    f"recommended_slope_threshold={rec_slope:.6f},"
+                    f"recommended_residual_threshold={rec_resid:.6f}\n"
+                )
+
+            gcmd.respond_info("---")
+            gcmd.respond_info(f"heatsoak calibrate: analyzed tail of {len(tail)} samples (last {tail_window_s:.0f}s of run)")
+            gcmd.respond_info(f"heatsoak calibrate: tail max|slope|={max_slope:.6f}, max resid={max_resid:.5f}, avg power={avg_power:.3f}")
+            gcmd.respond_info(f"heatsoak calibrate: recommended slope_threshold: {rec_slope:.5f}")
+            gcmd.respond_info(f"heatsoak calibrate: recommended residual_threshold: {rec_resid:.4f}")
+            gcmd.respond_info("---")
         finally:
             if csv_file is not None:
                 csv_file.close()
