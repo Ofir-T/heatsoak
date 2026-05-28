@@ -19,13 +19,19 @@ drops and then settles at whatever it takes to offset heat loss. That
 settled value is a better proxy for full equalization than the temperature
 reading alone.
 
-This plugin samples the heater's PWM duty cycle over a sliding window and
-declares steady state when:
+This plugin samples the heater's PWM duty cycle over a sliding window. The
+window is split in half and analyzed; the detector declares steady state when:
 
-  - the fitted slope of power vs. time is below a threshold (signal is flat)
-  - the std-dev of the residuals around that fit is below a threshold (oscillation is bounded)
+  - each half's fitted slope is below a threshold (signal is flat in both halves)
+  - the two halves' slopes don't differ by more than that threshold
+    (the slope itself isn't trending — no curvature)
+  - the std-dev of residuals around the full-window fit is below a threshold
+    (oscillation is bounded)
 
-Slope catches slow drift; residual variance catches loud PID oscillation.
+The slope check catches slow drift; the residual check catches loud PID
+oscillation; the split-window comparison catches "small slope but still
+curving toward an asymptote" — the failure mode of single-window slope
+detectors on exponentially-decaying signals.
 
 ## Installation
 
@@ -110,10 +116,14 @@ calibration command:
 ```gcode
 M140 S60
 M190 S60
-HEATSOAK_CALIBRATE             ; default 20 min observation
+HEATSOAK_CALIBRATE                  ; default duration = max_duration from config
 ; or:
-HEATSOAK_CALIBRATE DURATION=1800   ; 30 min for slower beds
+HEATSOAK_CALIBRATE DURATION=2400    ; 40 min if your bed is slow to settle
 ```
+
+The default observation duration matches `max_duration` from your `[heatsoak]`
+config, so the same upper bound governs both the runtime detector and the
+calibration. Override with `DURATION=` if needed.
 
 This runs a long observation **without applying any threshold check** — it
 samples for the full duration regardless of what the signal looks like. At the
@@ -129,9 +139,23 @@ recommended threshold values:
 
 Copy those values into your `[heatsoak]` config block.
 
+If the bed was still settling at the end of the run, you'll see a warning:
+
+```
+// heatsoak calibrate: WARNING - slope still decaying through end of run
+// (first-half max 0.000491, second-half max 0.000220).
+// Recommended thresholds may be too lenient. Re-run with longer DURATION.
+```
+
+This compares the slope magnitudes in the first and second halves of the
+analyzed tail. If the first half was significantly larger, the "tail" hadn't
+yet reached steady state and the recommendation will lean too lenient. Re-run
+with a longer `DURATION`.
+
 The calibration also writes a CSV trace (`cal_<from>Cto<to>C_<unix>.csv`),
-distinguishable from normal run traces. Useful for offline analysis if you
-want to see the full curve.
+distinguishable from normal run traces. The analysis line is written into the
+CSV as a `# ANALYSIS` comment, so you can recover the recommendation after
+the fact without re-running.
 
 ### Manual tuning (fallback)
 

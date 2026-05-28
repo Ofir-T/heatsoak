@@ -36,21 +36,43 @@ class SteadyStateDetector:
 
     def is_stable(self) -> bool:
         """
-        Return True when the window is full and both the fitted slope and the
-        residual std-dev are below their thresholds. False otherwise.
+        Return True when the signal is genuinely constant across the window.
 
-        Requiring a full window prevents false positives on partial data: a
-        4-sample regression on a slowly curving signal has too little leverage
-        to distinguish "still settling" from "actually flat".
+        Three checks must pass; if any fails, the signal is still moving:
+          1. residual_std below threshold (signal is quiet around its trend)
+          2. each half-window's slope below threshold (signal is flat in both halves)
+          3. the two halves' slopes don't differ by more than threshold
+             (no curvature - the slope itself isn't trending)
+
+        The third check is what distinguishes "constant" from "small but still
+        curving toward an asymptote". A signal in slow exponential decay can
+        satisfy a small full-window slope while still showing different slopes
+        in its first vs second half - this check rejects that case.
+
+        Requires a full window before any True is possible.
         """
         if len(self.samples) < self.window_size:
             return False
 
+        # Check 1: residual on the full-window linear fit
         status = self.get_status()
-        slope = status['slope']
-        residual_std = status['residual_std']
+        if status['residual_std'] >= self.residual_threshold:
+            return False
 
-        return (abs(slope) < self.slope_threshold) and (residual_std < self.residual_threshold)
+        # Checks 2 and 3: split-window slope analysis
+        samples = list(self.samples)
+        mid = len(samples) // 2
+        slope_first, _ = _fit_line(samples[:mid])
+        slope_second, _ = _fit_line(samples[mid:])
+
+        if abs(slope_first) >= self.slope_threshold:
+            return False
+        if abs(slope_second) >= self.slope_threshold:
+            return False
+        if abs(slope_first - slope_second) >= self.slope_threshold:
+            return False
+
+        return True
 
     def reset(self):
         """Clear all stored samples."""
@@ -241,7 +263,7 @@ class Heatsoak:
         "and suggest threshold values"
     )
     def cmd_HEATSOAK_CALIBRATE(self, gcmd):
-        duration = gcmd.get_float('DURATION', 1200., above=60.)
+        duration = gcmd.get_float('DURATION', self.max_duration, above=60.)
 
         target = self.heater.target_temp
         if target <= 0:
@@ -321,11 +343,26 @@ class Heatsoak:
             rec_slope = max_slope * 2.
             rec_resid = max_resid * 2.
 
+            # Sanity check: split the tail in half and compare. If the first
+            # half had significantly more drift than the second, the bed was
+            # still settling - the "tail" isn't yet a real steady-state
+            # noise floor and the recommendation will be too lenient.
+            mid = len(tail) // 2
+            first_half_max_slope = max(abs(r[2]) for r in tail[:mid]) if mid > 0 else 0.
+            second_half_max_slope = max(abs(r[2]) for r in tail[mid:]) if mid < len(tail) else 0.
+            tail_still_trending = (
+                first_half_max_slope > second_half_max_slope * 1.5
+                and first_half_max_slope > 0
+            )
+
             if csv_file is not None:
                 csv_file.write(
                     f"# ANALYSIS tail_samples={len(tail)},tail_window_s={tail_window_s:.0f},"
                     f"max_abs_slope={max_slope:.6f},max_residual_std={max_resid:.6f},"
                     f"avg_power={avg_power:.4f},"
+                    f"first_half_max_slope={first_half_max_slope:.6f},"
+                    f"second_half_max_slope={second_half_max_slope:.6f},"
+                    f"tail_still_trending={int(tail_still_trending)},"
                     f"recommended_slope_threshold={rec_slope:.6f},"
                     f"recommended_residual_threshold={rec_resid:.6f}\n"
                 )
@@ -333,6 +370,12 @@ class Heatsoak:
             gcmd.respond_info("---")
             gcmd.respond_info(f"heatsoak calibrate: analyzed tail of {len(tail)} samples (last {tail_window_s:.0f}s of run)")
             gcmd.respond_info(f"heatsoak calibrate: tail max|slope|={max_slope:.6f}, max resid={max_resid:.5f}, avg power={avg_power:.3f}")
+            if tail_still_trending:
+                gcmd.respond_info(
+                    f"heatsoak calibrate: WARNING - slope still decaying through end of run "
+                    f"(first-half max {first_half_max_slope:.6f}, second-half max {second_half_max_slope:.6f}). "
+                    f"Recommended thresholds may be too lenient. Re-run with longer DURATION."
+                )
             gcmd.respond_info(f"heatsoak calibrate: recommended slope_threshold: {rec_slope:.5f}")
             gcmd.respond_info(f"heatsoak calibrate: recommended residual_threshold: {rec_resid:.4f}")
             gcmd.respond_info("---")

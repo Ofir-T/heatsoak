@@ -66,6 +66,22 @@ def test_partial_window_returns_false():
     assert d.is_stable() is False
 
 
+def test_split_window_catches_curving_signal():
+    # Both half-window slopes are below the absolute threshold, but they
+    # differ enough that the signal is clearly still curving. The split-window
+    # check rejects this case; the previous full-window absolute-slope check
+    # would have passed it.
+    d = SteadyStateDetector(window_size=8, slope_threshold=0.01,
+                            residual_threshold=0.02)
+    # First half slope: +0.009 (rising). Second half slope: -0.005 (falling).
+    # |first - second| = 0.014, above slope_threshold=0.01.
+    samples = [(0, 0.500), (1, 0.509), (2, 0.518), (3, 0.527),
+               (4, 0.527), (5, 0.522), (6, 0.517), (7, 0.512)]
+    for t, p in samples:
+        d.add_sample(t, p)
+    assert d.is_stable() is False
+
+
 # --- get_status semantics ---
 
 def test_get_status_with_empty_window():
