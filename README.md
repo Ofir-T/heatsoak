@@ -74,6 +74,7 @@ slope_threshold: 0.005          # max rate of power change (PWM/sec) considered 
 residual_threshold: 0.02        # max std-dev of residuals around the fit (PWM)
 min_duration: 0                 # minimum wait regardless of detector (sec)
 max_duration: 1800              # hard cap, stops waiting and prints a message (sec)
+calibrate_temp: 60              # default TARGET for HEATSOAK_CALIBRATE
 log_path: ~/printer_data/logs/heatsoak/    # CSV trace per run; empty to disable
 ```
 
@@ -114,16 +115,16 @@ thermal characteristics. For best results on your specific machine, use the
 calibration command:
 
 ```gcode
-M140 S60
-M190 S60
-HEATSOAK_CALIBRATE                  ; default duration = max_duration from config
+HEATSOAK_CALIBRATE                              ; target = calibrate_temp from config
 ; or:
-HEATSOAK_CALIBRATE DURATION=2400    ; 40 min if your bed is slow to settle
+HEATSOAK_CALIBRATE TARGET=70 DURATION=2400      ; 70C, 40 min if your bed is slow to settle
 ```
 
-The default observation duration matches `max_duration` from your `[heatsoak]`
-config, so the same upper bound governs both the runtime detector and the
-calibration. Override with `DURATION=` if needed.
+`TARGET` defaults to `calibrate_temp` from your `[heatsoak]` config (default 60°C);
+the command sets the heater itself, so no separate
+`M140`/`M190` is needed. The default observation duration matches `max_duration`
+from your `[heatsoak]` config, so the same upper bound governs both the runtime
+detector and the calibration. Override with `DURATION=` if needed.
 
 This runs a long observation **without applying any threshold check** — it
 samples for the full duration regardless of what the signal looks like. At the

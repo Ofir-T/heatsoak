@@ -149,6 +149,7 @@ class Heatsoak:
         self.residual_threshold = config.getfloat('residual_threshold', 0.02, above=0)
         self.min_duration = config.getfloat('min_duration', 0.0, minval=0) # allow for hot printers to start quickly
         self.max_duration = config.getfloat('max_duration', 1800, minval=self.min_duration)
+        self.calibrate_temp = config.getfloat('calibrate_temp', 60., above=0.)
         self.log_path = config.get('log_path', '~/printer_data/logs/heatsoak/')
         if self.log_path:
             self.log_path = os.path.expanduser(self.log_path)
@@ -259,20 +260,20 @@ class Heatsoak:
                 csv_file.close()
 
     cmd_HEATSOAK_CALIBRATE_help = (
-        "Observe heater for DURATION seconds to characterize steady state "
-        "and suggest threshold values"
+        "Heat to TARGET and observe heater for DURATION seconds to "
+        "characterize steady state and suggest threshold values"
     )
     def cmd_HEATSOAK_CALIBRATE(self, gcmd):
         duration = gcmd.get_float('DURATION', self.max_duration, above=60.)
-
-        target = self.heater.target_temp
-        if target <= 0:
-            raise gcmd.error(f'Heater {self.heater_name} has no target temperature, skipping calibration')
+        target = gcmd.get_float('TARGET', self.calibrate_temp, above=0.)
 
         reactor = self.printer.get_reactor()
         start_status = self.heater.get_status(reactor.monotonic())
         start_temp = start_status['temperature']
         signal_source = 'integral' if self.use_integral else 'pwm'
+
+        pheaters = self.printer.lookup_object('heaters')
+        pheaters.set_temperature(self.heater, target)
 
         gcmd.respond_info(f"heatsoak calibrate: starting (target={target:.1f}C, start={start_temp:.1f}C, signal={signal_source}, duration={duration:.0f}s)")
 
