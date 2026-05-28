@@ -170,8 +170,9 @@ class Heatsoak:
         self.sample_interval = config.getfloat('sample_interval', 2.0, above=0)
         self.slope_threshold = config.getfloat('slope_threshold', 0.005, above=0)
         self.residual_threshold = config.getfloat('residual_threshold', 0.02, above=0)
-        self.relative_slope_threshold = config.getfloat('relative_slope_threshold', 0.002, minval=0.)
-        self.min_duration = config.getfloat('min_duration', 0.0, minval=0) # allow for hot printers to start quickly
+        self.relative_slope_threshold = config.getfloat('relative_slope_threshold', 0.0, minval=0.)
+        self.steady_state_power = config.getfloat('steady_state_power', 0.0, minval=0.)
+        self.min_duration = config.getfloat('min_duration', 0.0, minval=0)
         self.max_duration = config.getfloat('max_duration', 1800, minval=self.min_duration)
         self.calibrate_temp = config.getfloat('calibrate_temp', 60., above=0.)
         self.log_path = config.get('log_path', '~/printer_data/logs/heatsoak/')
@@ -259,7 +260,9 @@ class Heatsoak:
                     result = 'timeout'
                 else:
                     self.detector.add_sample(eventtime, power)
-                    if elapsed >= min_duration and self.detector.is_stable():
+                    power_ok = (self.steady_state_power <= 0.
+                                or power <= self.steady_state_power * 1.5)
+                    if elapsed >= min_duration and power_ok and self.detector.is_stable():
                         result = 'steady_state'
 
                 # log every sample, including the endpoint
@@ -419,7 +422,8 @@ class Heatsoak:
                     f"tail_still_trending={int(tail_still_trending)},"
                     f"recommended_slope_threshold={rec_slope:.6f},"
                     f"recommended_residual_threshold={rec_resid:.6f},"
-                    f"recommended_relative_slope_threshold={rec_rel_slope:.6f}\n"
+                    f"recommended_relative_slope_threshold={rec_rel_slope:.6f},"
+                    f"recommended_steady_state_power={avg_power:.6f}\n"
                 )
 
             gcmd.respond_info("---")
@@ -434,6 +438,7 @@ class Heatsoak:
             gcmd.respond_info(f"heatsoak calibrate: recommended slope_threshold: {rec_slope:.5f}")
             gcmd.respond_info(f"heatsoak calibrate: recommended residual_threshold: {rec_resid:.4f}")
             gcmd.respond_info(f"heatsoak calibrate: recommended relative_slope_threshold: {rec_rel_slope:.5f}")
+            gcmd.respond_info(f"heatsoak calibrate: recommended steady_state_power: {avg_power:.4f}")
             gcmd.respond_info("---")
         finally:
             if csv_file is not None:

@@ -80,7 +80,8 @@ window_size: 15                 # sliding window length (samples); also the
 sample_interval: 2.0            # seconds between samples
 slope_threshold: 0.005          # max rate of power change (PWM/sec) considered flat
 residual_threshold: 0.02        # max std-dev of residuals around the fit (PWM)
-relative_slope_threshold: 0.002 # max |slope/power| (/sec); 0 to disable
+relative_slope_threshold: 0.0   # max |slope/power| (/sec); 0 to disable
+steady_state_power: 0.0         # power bound from HEATSOAK_CALIBRATE; 0 to disable
 min_duration: 0                 # minimum wait regardless of detector (sec)
 max_duration: 1800              # hard cap, stops waiting and prints a message (sec)
 calibrate_temp: 60              # default TARGET for HEATSOAK_CALIBRATE
@@ -146,6 +147,7 @@ recommended threshold values:
 // heatsoak calibrate: recommended slope_threshold: 0.00010
 // heatsoak calibrate: recommended residual_threshold: 0.0084
 // heatsoak calibrate: recommended relative_slope_threshold: 0.00120
+// heatsoak calibrate: recommended steady_state_power: 0.1650
 ```
 
 Copy those values into your `[heatsoak]` config block.
