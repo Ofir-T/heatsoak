@@ -38,24 +38,27 @@ class SteadyStateDetector:
         """
         Return True when the signal is genuinely constant across the window.
 
-        Three checks must pass; if any fails, the signal is still moving:
-          1. residual_std below threshold (signal is quiet around its trend)
-          2. each half-window's slope below threshold (signal is flat in both halves)
-          3. the two halves' slopes don't differ by more than threshold
+        Four checks must pass; if any fails, the signal is still moving:
+          1. full-window slope below threshold (signal is trending down/up slowly)
+          2. residual_std below threshold (signal is quiet around its trend)
+          3. each half-window's slope below threshold (signal is flat in both halves)
+          4. the two halves' slopes don't differ by more than threshold
              (no curvature - the slope itself isn't trending)
 
-        The third check is what distinguishes "constant" from "small but still
-        curving toward an asymptote". A signal in slow exponential decay can
-        satisfy a small full-window slope while still showing different slopes
-        in its first vs second half - this check rejects that case.
+        Check 1 catches signals still in exponential decay whose curvature
+        within each half makes the split-window slopes look deceptively small.
+        Checks 3 and 4 catch signals that look flat on average but are still
+        curving toward an asymptote — the failure mode of a full-window-only detector.
 
         Requires a full window before any True is possible.
         """
         if len(self.samples) < self.window_size:
             return False
 
-        # Check 1: residual on the full-window linear fit
+        # Check 1: full-window fit — slope and noise floor
         status = self.get_status()
+        if abs(status['slope']) >= self.slope_threshold:
+            return False
         if status['residual_std'] >= self.residual_threshold:
             return False
 

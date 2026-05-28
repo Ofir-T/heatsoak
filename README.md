@@ -19,19 +19,21 @@ drops and then settles at whatever it takes to offset heat loss. That
 settled value is a better proxy for full equalization than the temperature
 reading alone.
 
-This plugin samples the heater's PWM duty cycle over a sliding window. The
-window is split in half and analyzed; the detector declares steady state when:
+This plugin samples the heater's PWM duty cycle over a sliding window and
+declares steady state when four conditions all hold:
 
-  - each half's fitted slope is below a threshold (signal is flat in both halves)
-  - the two halves' slopes don't differ by more than that threshold
-    (the slope itself isn't trending — no curvature)
-  - the std-dev of residuals around the full-window fit is below a threshold
+  - the full-window fitted slope is below a threshold (signal is trending slowly)
+  - the std-dev of residuals around that fit is below a threshold
     (oscillation is bounded)
+  - each half-window's slope is also below the threshold (flat in both halves)
+  - the two halves' slopes don't differ by more than the threshold
+    (the slope itself isn't trending — no curvature)
 
-The slope check catches slow drift; the residual check catches loud PID
-oscillation; the split-window comparison catches "small slope but still
-curving toward an asymptote" — the failure mode of single-window slope
-detectors on exponentially-decaying signals.
+The full-window slope check catches signals still in exponential decay whose
+curvature makes each half look deceptively flat. The residual check catches
+loud PID oscillation. The split-window comparison catches "small average slope
+but still curving toward an asymptote" — the failure mode of single-window
+slope detectors on exponentially-decaying signals.
 
 ## Installation
 
