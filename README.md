@@ -20,9 +20,12 @@ settled value is a better proxy for full equalization than the temperature
 reading alone.
 
 This plugin samples the heater's PWM duty cycle over a sliding window and
-declares steady state when four conditions all hold:
+declares steady state when five conditions all hold:
 
   - the full-window fitted slope is below a threshold (signal is trending slowly)
+  - the relative slope `|slope / power|` is below a threshold — catches
+    mid-decay phases where the absolute slope looks small but power is still
+    far from its settled value
   - the std-dev of residuals around that fit is below a threshold
     (oscillation is bounded)
   - each half-window's slope is also below the threshold (flat in both halves)
@@ -30,10 +33,13 @@ declares steady state when four conditions all hold:
     (the slope itself isn't trending — no curvature)
 
 The full-window slope check catches signals still in exponential decay whose
-curvature makes each half look deceptively flat. The residual check catches
-loud PID oscillation. The split-window comparison catches "small average slope
-but still curving toward an asymptote" — the failure mode of single-window
-slope detectors on exponentially-decaying signals.
+curvature makes each half look deceptively flat. The relative slope check
+catches the slow-approach tail of exponential decay: absolute slope can drop
+below the threshold thousands of seconds before the signal reaches its
+asymptote, but `|slope/power|` stays elevated until power is genuinely near
+its settled value. The residual check catches loud PID oscillation. The
+split-window comparison catches "small average slope but still curving toward
+an asymptote" — the failure mode of single-window slope detectors.
 
 ## Installation
 
@@ -74,6 +80,7 @@ window_size: 15                 # sliding window length (samples); also the
 sample_interval: 2.0            # seconds between samples
 slope_threshold: 0.005          # max rate of power change (PWM/sec) considered flat
 residual_threshold: 0.02        # max std-dev of residuals around the fit (PWM)
+relative_slope_threshold: 0.002 # max |slope/power| (/sec); 0 to disable
 min_duration: 0                 # minimum wait regardless of detector (sec)
 max_duration: 1800              # hard cap, stops waiting and prints a message (sec)
 calibrate_temp: 60              # default TARGET for HEATSOAK_CALIBRATE
@@ -138,6 +145,7 @@ recommended threshold values:
 // heatsoak calibrate: tail max|slope|=0.000048, max resid=0.0042, avg power=0.165
 // heatsoak calibrate: recommended slope_threshold: 0.00010
 // heatsoak calibrate: recommended residual_threshold: 0.0084
+// heatsoak calibrate: recommended relative_slope_threshold: 0.00120
 ```
 
 Copy those values into your `[heatsoak]` config block.

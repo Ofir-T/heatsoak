@@ -109,6 +109,35 @@ def test_get_status_with_three_samples_has_both():
     assert status['residual_std'] == pytest.approx(0.0, abs=1e-9)
 
 
+# --- relative slope check ---
+
+def test_relative_slope_rejects_mid_decay():
+    # slope=-0.0015 passes absolute threshold=0.002, but |slope/power|=0.006 fails relative=0.002
+    d = SteadyStateDetector(window_size=4, slope_threshold=0.002,
+                            residual_threshold=0.01, relative_slope_threshold=0.002)
+    for t, p in [(0, 0.253), (1, 0.2515), (2, 0.250), (3, 0.2485)]:
+        d.add_sample(t, p)
+    assert d.is_stable() is False
+
+
+def test_relative_slope_passes_genuine_steady_state():
+    # slope≈0, power≈0.097: |slope/power| ≈ 0, well below threshold
+    d = SteadyStateDetector(window_size=4, slope_threshold=0.002,
+                            residual_threshold=0.01, relative_slope_threshold=0.002)
+    for t in range(4):
+        d.add_sample(t, 0.097)
+    assert d.is_stable() is True
+
+
+def test_relative_slope_disabled_when_zero():
+    # Same mid-decay signal; with relative_slope_threshold=0, check is skipped
+    d = SteadyStateDetector(window_size=4, slope_threshold=0.002,
+                            residual_threshold=0.01, relative_slope_threshold=0.0)
+    for t, p in [(0, 0.253), (1, 0.2515), (2, 0.250), (3, 0.2485)]:
+        d.add_sample(t, p)
+    assert d.is_stable() is True
+
+
 # --- reset ---
 
 def test_reset_clears_samples_and_status():

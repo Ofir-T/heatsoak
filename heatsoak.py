@@ -9,8 +9,13 @@ import time
 from collections import deque
 from math import sqrt
 
+# Floor applied to |current_power| when computing relative slope.
+# Prevents division by near-zero on beds that have nearly reached setpoint.
+_POWER_FLOOR = 0.05
+
 class SteadyStateDetector:
-    def __init__(self, window_size, slope_threshold, residual_threshold):
+    def __init__(self, window_size, slope_threshold, residual_threshold,
+                 relative_slope_threshold=0.0):
         """
         Initializes the steady-state detector.
 
@@ -22,6 +27,7 @@ class SteadyStateDetector:
         self.window_size = window_size
         self.slope_threshold = slope_threshold
         self.residual_threshold = residual_threshold
+        self.relative_slope_threshold = relative_slope_threshold
         self.samples = deque(maxlen=window_size)
 
     def add_sample(self, timestamp, power):
@@ -38,31 +44,45 @@ class SteadyStateDetector:
         """
         Return True when the signal is genuinely constant across the window.
 
-        Four checks must pass; if any fails, the signal is still moving:
-          1. full-window slope below threshold (signal is trending down/up slowly)
-          2. residual_std below threshold (signal is quiet around its trend)
-          3. each half-window's slope below threshold (signal is flat in both halves)
-          4. the two halves' slopes don't differ by more than threshold
+        Five checks must pass; if any fails, the signal is still moving:
+          1. full-window slope below threshold (signal is trending slowly)
+          2. relative slope |slope/power| below threshold — catches mid-decay
+             phases where absolute slope looks small but power is still far
+             from its settled value (only applied when relative_slope_threshold > 0)
+          3. residual_std below threshold (signal is quiet around its trend)
+          4. each half-window's slope below threshold (signal is flat in both halves)
+          5. the two halves' slopes don't differ by more than threshold
              (no curvature - the slope itself isn't trending)
 
         Check 1 catches signals still in exponential decay whose curvature
         within each half makes the split-window slopes look deceptively small.
-        Checks 3 and 4 catch signals that look flat on average but are still
-        curving toward an asymptote — the failure mode of a full-window-only detector.
+        Check 2 catches signals where |slope| is small in absolute terms but
+        large relative to the current power level — typical of slow-approach
+        exponential tails. Checks 4 and 5 catch signals that look flat on
+        average but are still curving toward an asymptote.
 
         Requires a full window before any True is possible.
         """
         if len(self.samples) < self.window_size:
             return False
 
-        # Check 1: full-window fit — slope and noise floor
+        # Check 1: full-window slope magnitude
         status = self.get_status()
         if abs(status['slope']) >= self.slope_threshold:
             return False
+
+        # Check 2: relative slope — |slope / power|
+        if self.relative_slope_threshold > 0.:
+            current_power = self.samples[-1][1]
+            effective_power = max(abs(current_power), _POWER_FLOOR)
+            if abs(status['slope']) / effective_power >= self.relative_slope_threshold:
+                return False
+
+        # Check 3: residual noise floor
         if status['residual_std'] >= self.residual_threshold:
             return False
 
-        # Checks 2 and 3: split-window slope analysis
+        # Checks 4 and 5: split-window slope analysis
         samples = list(self.samples)
         mid = len(samples) // 2
         slope_first, _ = _fit_line(samples[:mid])
@@ -150,6 +170,7 @@ class Heatsoak:
         self.sample_interval = config.getfloat('sample_interval', 2.0, above=0)
         self.slope_threshold = config.getfloat('slope_threshold', 0.005, above=0)
         self.residual_threshold = config.getfloat('residual_threshold', 0.02, above=0)
+        self.relative_slope_threshold = config.getfloat('relative_slope_threshold', 0.002, minval=0.)
         self.min_duration = config.getfloat('min_duration', 0.0, minval=0) # allow for hot printers to start quickly
         self.max_duration = config.getfloat('max_duration', 1800, minval=self.min_duration)
         self.calibrate_temp = config.getfloat('calibrate_temp', 60., above=0.)
@@ -158,7 +179,8 @@ class Heatsoak:
             self.log_path = os.path.expanduser(self.log_path)
 
         self.detector = SteadyStateDetector(self.window_size, self.slope_threshold,
-                                            self.residual_threshold)
+                                            self.residual_threshold,
+                                            self.relative_slope_threshold)
 
         # find heater after entire config was initialized
         self.heater = None
@@ -214,7 +236,7 @@ class Heatsoak:
                 filename = os.path.join(self.log_path, f"run_{int(start_temp)}Cto{int(target)}C_{int(time.time())}.csv")
                 csv_file = open(filename, 'w')
                 csv_file.write(f"# start_temp={start_temp:.2f},target={target:.1f},signal={signal_source},start_unix={int(time.time())}\n")
-                csv_file.write("elapsed_s,unix_time,temp,target,power,slope,residual_std,sample_count\n")
+                csv_file.write("elapsed_s,unix_time,temp,target,power,slope,rel_slope,residual_std,sample_count\n")
                 gcmd.respond_info(f"heatsoak: logging to {filename}")
 
             self.detector.reset()
@@ -226,38 +248,56 @@ class Heatsoak:
                 eventtime = reactor.pause(eventtime + 1.)
 
             # perform heatsoak
+            result = None
             while not self.printer.is_shutdown():
-                eventtime = reactor.pause(eventtime + self.sample_interval) # yield until the next sample window
+                eventtime = reactor.pause(eventtime + self.sample_interval)
                 elapsed = eventtime - start_time
                 heater_status = self.heater.get_status(eventtime)
                 power = self._read_signal()
 
-                if elapsed > max_duration: # timeout
-                    gcmd.respond_info(f"heatsoak: max_duration {max_duration:.0f}s exceeded, proceeding anyway (last power={power:.3f})")
-                    return
+                if elapsed > max_duration:
+                    result = 'timeout'
+                else:
+                    self.detector.add_sample(eventtime, power)
+                    if elapsed >= min_duration and self.detector.is_stable():
+                        result = 'steady_state'
 
-                # next sample
-                self.detector.add_sample(eventtime, power)
-                if elapsed >= min_duration and self.detector.is_stable():
-                    gcmd.respond_info(f"heatsoak: steady state reached at t={elapsed:.0f}s (power={power:.3f})")
-                    return
-
-                # progress update
+                # log every sample, including the endpoint
                 det = self.detector.get_status()
-                slope = det['slope'] if det['slope'] is not None else 0.
-                resid = det['residual_std'] if det['residual_std'] is not None else 0.
-                n = det['sample_count']
-                gcmd.respond_info(f"heatsoak: t={elapsed:.0f}s power={power:.3f} slope={slope:.5f} resid={resid:.4f} n={n}")
+                slope_val = det['slope']
+                resid_val = det['residual_std']
+                rel_slope_val = None
+                if slope_val is not None:
+                    effective_power = max(abs(power), _POWER_FLOOR)
+                    rel_slope_val = slope_val / effective_power
 
-                # csv log
+                slope = slope_val if slope_val is not None else 0.
+                resid = resid_val if resid_val is not None else 0.
+                n = det['sample_count']
+                gcmd.respond_info(f"heatsoak: t={elapsed:.0f}s power={power:.3f} slope={slope:.5f} rel={rel_slope_val:.5f} resid={resid:.4f} n={n}"
+                                  if rel_slope_val is not None else
+                                  f"heatsoak: t={elapsed:.0f}s power={power:.3f} slope={slope:.5f} resid={resid:.4f} n={n}")
+
                 if csv_file is not None:
-                    slope_str = f"{det['slope']:.6f}" if det['slope'] is not None else ""
-                    resid_str = f"{det['residual_std']:.6f}" if det['residual_std'] is not None else ""
+                    slope_str = f"{slope_val:.6f}" if slope_val is not None else ""
+                    rel_str = f"{rel_slope_val:.6f}" if rel_slope_val is not None else ""
+                    resid_str = f"{resid_val:.6f}" if resid_val is not None else ""
                     csv_file.write(
                         f"{elapsed:.2f},{time.time():.2f},"
                         f"{heater_status['temperature']:.2f},{heater_status['target']:.1f},"
-                        f"{power:.4f},{slope_str},{resid_str},{det['sample_count']}\n"
+                        f"{power:.4f},{slope_str},{rel_str},{resid_str},{det['sample_count']}\n"
                     )
+
+                if result == 'timeout':
+                    gcmd.respond_info(f"heatsoak: max_duration {max_duration:.0f}s exceeded, proceeding anyway (power={power:.3f})")
+                    if csv_file is not None:
+                        csv_file.write(f"# RESULT: timeout at t={elapsed:.0f}s\n")
+                    return
+                if result == 'steady_state':
+                    gcmd.respond_info(f"heatsoak: steady state reached at t={elapsed:.0f}s (power={power:.3f})")
+                    if csv_file is not None:
+                        csv_file.write(f"# RESULT: steady_state at t={elapsed:.0f}s\n")
+                    return
         finally:
             if csv_file is not None:
                 csv_file.close()
@@ -288,7 +328,7 @@ class Heatsoak:
                 filename = os.path.join(self.log_path, f"cal_{int(start_temp)}Cto{int(target)}C_{int(time.time())}.csv")
                 csv_file = open(filename, 'w')
                 csv_file.write(f"# CALIBRATION start_temp={start_temp:.2f},target={target:.1f},signal={signal_source},duration={duration:.0f},start_unix={int(time.time())}\n")
-                csv_file.write("elapsed_s,unix_time,temp,target,power,slope,residual_std,sample_count\n")
+                csv_file.write("elapsed_s,unix_time,temp,target,power,slope,rel_slope,residual_std,sample_count\n")
                 gcmd.respond_info(f"heatsoak calibrate: logging to {filename}")
 
             self.detector.reset()
@@ -318,12 +358,19 @@ class Heatsoak:
 
                 # csv log
                 if csv_file is not None:
-                    slope_csv = f"{det['slope']:.6f}" if det['slope'] is not None else ""
-                    resid_csv = f"{det['residual_std']:.6f}" if det['residual_std'] is not None else ""
+                    slope_val = det['slope']
+                    resid_val = det['residual_std']
+                    rel_slope_val = None
+                    if slope_val is not None:
+                        effective_power = max(abs(power), _POWER_FLOOR)
+                        rel_slope_val = slope_val / effective_power
+                    slope_csv = f"{slope_val:.6f}" if slope_val is not None else ""
+                    rel_csv = f"{rel_slope_val:.6f}" if rel_slope_val is not None else ""
+                    resid_csv = f"{resid_val:.6f}" if resid_val is not None else ""
                     csv_file.write(
                         f"{elapsed:.2f},{time.time():.2f},"
                         f"{heater_status['temperature']:.2f},{heater_status['target']:.1f},"
-                        f"{power:.4f},{slope_csv},{resid_csv},{det['sample_count']}\n"
+                        f"{power:.4f},{slope_csv},{rel_csv},{resid_csv},{det['sample_count']}\n"
                     )
 
             # analysis: characterize the tail (presumed steady state)
@@ -344,8 +391,10 @@ class Heatsoak:
             max_slope = max(abs(r[2]) for r in tail)
             max_resid = max(r[3] for r in tail)
             avg_power = sum(r[1] for r in tail) / len(tail)
+            max_rel_slope = max(abs(r[2]) / max(abs(r[1]), _POWER_FLOOR) for r in tail)
             rec_slope = max_slope * 2.
             rec_resid = max_resid * 2.
+            rec_rel_slope = max_rel_slope * 2.
 
             # Sanity check: split the tail in half and compare. If the first
             # half had significantly more drift than the second, the bed was
@@ -364,11 +413,13 @@ class Heatsoak:
                     f"# ANALYSIS tail_samples={len(tail)},tail_window_s={tail_window_s:.0f},"
                     f"max_abs_slope={max_slope:.6f},max_residual_std={max_resid:.6f},"
                     f"avg_power={avg_power:.4f},"
+                    f"max_rel_slope={max_rel_slope:.6f},"
                     f"first_half_max_slope={first_half_max_slope:.6f},"
                     f"second_half_max_slope={second_half_max_slope:.6f},"
                     f"tail_still_trending={int(tail_still_trending)},"
                     f"recommended_slope_threshold={rec_slope:.6f},"
-                    f"recommended_residual_threshold={rec_resid:.6f}\n"
+                    f"recommended_residual_threshold={rec_resid:.6f},"
+                    f"recommended_relative_slope_threshold={rec_rel_slope:.6f}\n"
                 )
 
             gcmd.respond_info("---")
@@ -382,6 +433,7 @@ class Heatsoak:
                 )
             gcmd.respond_info(f"heatsoak calibrate: recommended slope_threshold: {rec_slope:.5f}")
             gcmd.respond_info(f"heatsoak calibrate: recommended residual_threshold: {rec_resid:.4f}")
+            gcmd.respond_info(f"heatsoak calibrate: recommended relative_slope_threshold: {rec_rel_slope:.5f}")
             gcmd.respond_info("---")
         finally:
             if csv_file is not None:
