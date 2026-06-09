@@ -6,40 +6,10 @@ PWM output instead of waiting a fixed time.
 ## Why
 
 `M190` / `TEMPERATURE_WAIT` return as soon as the bed *sensor* reads target
-temperature. But a single thermistor under one spot of the bed only tells
-you that *this* spot is at temperature, not the rest of the plate, the
-gantry, or the chamber.
+temperature — not when the surrounding frame, gantry, and chamber have caught up.
 
-The usual workaround is a constant wait, which has to be long enough for
-cold prints and is therefore wasteful for warm ones.
-
-Heater power tells you more: as the surrounding material catches up,
-the PID controller needs less energy to hold temperature, so PWM duty cycle
-drops and then settles at whatever it takes to offset heat loss. That
-settled value is a better proxy for full equalization than the temperature
-reading alone.
-
-This plugin samples the heater's PWM duty cycle over a sliding window and
-declares steady state when five conditions all hold:
-
-  - the full-window fitted slope is below a threshold (signal is trending slowly)
-  - the relative slope `|slope / power|` is below a threshold — catches
-    mid-decay phases where the absolute slope looks small but power is still
-    far from its settled value
-  - the std-dev of residuals around that fit is below a threshold
-    (oscillation is bounded)
-  - each half-window's slope is also below the threshold (flat in both halves)
-  - the two halves' slopes don't differ by more than the threshold
-    (the slope itself isn't trending — no curvature)
-
-The full-window slope check catches signals still in exponential decay whose
-curvature makes each half look deceptively flat. The relative slope check
-catches the slow-approach tail of exponential decay: absolute slope can drop
-below the threshold thousands of seconds before the signal reaches its
-asymptote, but `|slope/power|` stays elevated until power is genuinely near
-its settled value. The residual check catches loud PID oscillation. The
-split-window comparison catches "small average slope but still curving toward
-an asymptote" — the failure mode of single-window slope detectors.
+As the thermal mass equilibrates, the PID controller draws less power to hold
+temperature. This plugin watches that power drop and exits when it settles, so cold prints wait as long as they need to and warm ones exit early.
 
 ## Installation
 
@@ -69,27 +39,32 @@ install_script: install.sh
 
 ## Configuration
 
-Add to `printer.cfg`:
+Add a minimal section to `printer.cfg` to get started:
 
 ```ini
 [heatsoak]
-heater: heater_bed              # which heater to watch
-window_size: 15                 # sliding window length (samples); also the
-                                # number of samples that must accumulate before
-                                # a steady-state decision can be made
-sample_interval: 2.0            # seconds between samples
-slope_threshold: 0.005          # max rate of power change (PWM/sec) considered flat
-residual_threshold: 0.02        # max std-dev of residuals around the fit (PWM)
-relative_slope_threshold: 0.0   # max |slope/power| (/sec); 0 to disable
-steady_state_power: 0.0         # power bound from HEATSOAK_CALIBRATE; 0 to disable
-min_duration: 0                 # minimum wait regardless of detector (sec)
-max_duration: 1800              # hard cap, stops waiting and prints a message (sec)
-calibrate_temp: 60              # default TARGET for HEATSOAK_CALIBRATE
-log_path: ~/printer_data/logs/heatsoak/    # CSV trace per run; empty to disable
+heater: heater_bed
 ```
 
-All fields optional; defaults above. `min_duration: 0` means an already-hot
-bed exits the loop as soon as the detector has enough samples.
+Everything else has safe defaults. Run `HEATSOAK_CALIBRATE` (see [Tuning](#tuning))
+to fill in the threshold values, then `SAVE_CONFIG`.
+
+Full reference — all fields except `heater` are optional:
+
+```ini
+[heatsoak]
+heater: heater_bed              # required: which heater to watch
+window_size: 30                 # sliding window length (samples)
+sample_interval: 2.0            # seconds between samples
+min_duration: 0                 # minimum wait regardless of detector (sec)
+max_duration: 1800              # hard cap, stops waiting and prints a message (sec)
+log_path: ~/printer_data/logs/heatsoak/    # CSV trace per run; empty to disable
+# set by HEATSOAK_CALIBRATE + SAVE_CONFIG:
+slope_threshold: 0.005
+residual_threshold: 0.02
+relative_slope_threshold: 0.0
+steady_state_power: 0.0
+```
 
 ## Usage
 
@@ -102,44 +77,56 @@ HEATSOAK_WAIT
 G28
 ```
 
-Optional per-call overrides:
+For prints where only bed surface temperature matters, `MODE=quick` exits at the
+inflection point of the power decay — when the bed surface is at temperature but
+the frame and gantry are still catching up (~90s into a 60°C cold start vs ~430s
+for full equilibration):
+
+```gcode
+HEATSOAK_WAIT MODE=quick
+```
+
+Per-call overrides:
 
 ```gcode
 HEATSOAK_WAIT MIN_DURATION=120 MAX_DURATION=600
+HEATSOAK_WAIT MODE=quick MAX_DURATION=300
 ```
 
 Console output:
 
 ```
-// heatsoak: starting (target=60.0C min=0s max=1800s)
-// heatsoak: t=10s power=0.142 slope=-0.00614 resid=0.0036 n=5
-// heatsoak: t=20s power=0.118 slope=-0.00422 resid=0.0028 n=10
+// heatsoak: starting (target=60.0C start=25.0C signal=integral mode=full min=0s max=1800s)
+// heatsoak: t=10s power=0.561 slope=-0.01842 resid=0.0041 n=5
 ...
-// heatsoak: steady state reached at t=128s (power=0.062)
+// heatsoak: steady state reached at t=428s (power=0.062)
+```
+
+```
+// heatsoak: starting (target=60.0C start=25.0C signal=integral mode=quick min=0s max=1800s)
+...
+// heatsoak: tail entry at t=97s (power=0.561), bed surface at temp
 ```
 
 ## Tuning
 
 The defaults are reasonable starting points, but every printer has its own
-thermal characteristics. For best results on your specific machine, use the
-calibration command:
+thermal characteristics. For best results, run the calibration command after
+setting your target temperature:
 
 ```gcode
-HEATSOAK_CALIBRATE                              ; target = calibrate_temp from config
-; or:
-HEATSOAK_CALIBRATE TARGET=70 DURATION=2400      ; 70C, 40 min if your bed is slow to settle
+M140 S60
+HEATSOAK_CALIBRATE
+; or override directly:
+HEATSOAK_CALIBRATE TARGET=70 DURATION=2400
 ```
 
-`TARGET` defaults to `calibrate_temp` from your `[heatsoak]` config (default 60°C);
-the command sets the heater itself, so no separate
-`M140`/`M190` is needed. The default observation duration matches `max_duration`
-from your `[heatsoak]` config, so the same upper bound governs both the runtime
-detector and the calibration. Override with `DURATION=` if needed.
-
-This runs a long observation **without applying any threshold check** — it
-samples for the full duration regardless of what the signal looks like. At the
-end it analyzes the tail of the trace (presumed steady state) and prints
-recommended threshold values:
+`TARGET` defaults to the heater's current target; `DURATION` defaults to
+`max_duration` from config. **Minimum recommended duration is 900 s** (15 min);
+1800 s is sufficient for most printers. If your bed is large or slow to equalize,
+use `DURATION=2400` or longer. This runs a full observation without applying any
+threshold checks, analyzes the tail, and stages the recommended values for
+`SAVE_CONFIG`:
 
 ```
 // heatsoak calibrate: analyzed tail of 150 samples (last 300s of run)
@@ -148,31 +135,15 @@ recommended threshold values:
 // heatsoak calibrate: recommended residual_threshold: 0.0084
 // heatsoak calibrate: recommended relative_slope_threshold: 0.00120
 // heatsoak calibrate: recommended steady_state_power: 0.1650
+// heatsoak calibrate: run SAVE_CONFIG to persist these values
 ```
 
-Copy those values into your `[heatsoak]` config block.
+Then run `SAVE_CONFIG` to write them to `printer.cfg` and restart Klipper.
 
-If the bed was still settling at the end of the run, you'll see a warning:
-
-```
-// heatsoak calibrate: WARNING - slope still decaying through end of run
-// (first-half max 0.000491, second-half max 0.000220).
-// Recommended thresholds may be too lenient. Re-run with longer DURATION.
-```
-
-This compares the slope magnitudes in the first and second halves of the
-analyzed tail. If the first half was significantly larger, the "tail" hadn't
-yet reached steady state and the recommendation will lean too lenient. Re-run
-with a longer `DURATION`.
-
-The calibration also writes a CSV trace (`cal_<from>Cto<to>C_<unix>.csv`),
-distinguishable from normal run traces. The analysis line is written into the
-CSV as a `# ANALYSIS` comment, so you can recover the recommendation after
-the fact without re-running.
+If the bed was still settling at the end of the run the values are **not** staged
+and you'll see a warning — re-run with a longer `DURATION`, then `SAVE_CONFIG`.
 
 ### Manual tuning (fallback)
-
-If you want to tune without running calibration:
 
 1. Run `HEATSOAK_WAIT MAX_DURATION=300` and watch the console output.
 2. Note the `slope` and `resid` values after the bed has visibly settled

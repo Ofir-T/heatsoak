@@ -29,6 +29,7 @@ class SteadyStateDetector:
         self.residual_threshold = residual_threshold
         self.relative_slope_threshold = relative_slope_threshold
         self.samples = deque(maxlen=window_size)
+        self._in_tail = False
 
     def add_sample(self, timestamp, power):
         """
@@ -83,10 +84,7 @@ class SteadyStateDetector:
             return False
 
         # Checks 4 and 5: split-window slope analysis
-        samples = list(self.samples)
-        mid = len(samples) // 2
-        slope_first, _ = _fit_line(samples[:mid])
-        slope_second, _ = _fit_line(samples[mid:])
+        slope_first, slope_second = self._split_window_slopes()
 
         if abs(slope_first) >= self.slope_threshold:
             return False
@@ -97,9 +95,40 @@ class SteadyStateDetector:
 
         return True
 
+    def is_in_tail(self) -> bool:
+        """
+        Return True once the inflection from fast-decay to slow-tail is detected.
+
+        The inflection is identified by the split-window slope sign flip:
+          - slope_first < -slope_threshold  (first half is clearly in decay)
+          - slope_second > slope_first      (second half is less steep — deceleration)
+
+        Once triggered the result is latched: PID noise after the inflection
+        would otherwise cause the sign to flip back on subsequent windows.
+        Requires a full window before any True is possible.
+        """
+        if self._in_tail:
+            return True
+        if len(self.samples) < self.window_size:
+            return False
+        slope_first, slope_second = self._split_window_slopes()
+        if slope_first < -self.slope_threshold and slope_second > slope_first:
+            self._in_tail = True
+            return True
+        return False
+
+    def _split_window_slopes(self):
+        """Fit a line to each half of the current window; return (slope_first, slope_second)."""
+        samples = list(self.samples)
+        mid = len(samples) // 2
+        slope_first, _ = _fit_line(samples[:mid])
+        slope_second, _ = _fit_line(samples[mid:])
+        return slope_first, slope_second
+
     def reset(self):
-        """Clear all stored samples."""
+        """Clear all stored samples and the tail-entry latch."""
         self.samples.clear()
+        self._in_tail = False
 
     def get_status(self):
         """
@@ -165,8 +194,8 @@ class Heatsoak:
     def __init__(self, config):
         self.printer = config.get_printer()
 
-        self.heater_name = config.get('heater', 'heater_bed')
-        self.window_size = config.getint('window_size', 15, minval=4)
+        self.heater_name = config.get('heater')
+        self.window_size = config.getint('window_size', 30, minval=4)
         self.sample_interval = config.getfloat('sample_interval', 2.0, above=0)
         self.slope_threshold = config.getfloat('slope_threshold', 0.005, above=0)
         self.residual_threshold = config.getfloat('residual_threshold', 0.02, above=0)
@@ -174,7 +203,6 @@ class Heatsoak:
         self.steady_state_power = config.getfloat('steady_state_power', 0.0, minval=0.)
         self.min_duration = config.getfloat('min_duration', 0.0, minval=0)
         self.max_duration = config.getfloat('max_duration', 1800, minval=self.min_duration)
-        self.calibrate_temp = config.getfloat('calibrate_temp', 60., above=0.)
         self.log_path = config.get('log_path', '~/printer_data/logs/heatsoak/')
         if self.log_path:
             self.log_path = os.path.expanduser(self.log_path)
@@ -214,10 +242,13 @@ class Heatsoak:
                 return ctrl.Ki * ctrl.prev_temp_integ
             return self.heater.last_pwm_value
 
-    cmd_HEATSOAK_WAIT_help = "Wait until heater reaches thermal steady state"
+    cmd_HEATSOAK_WAIT_help = "Wait until heater reaches thermal steady state (MODE=full) or tail entry (MODE=quick)"
     def cmd_HEATSOAK_WAIT(self, gcmd):
         min_duration = gcmd.get_float('MIN_DURATION', self.min_duration, minval=0.)
         max_duration = gcmd.get_float('MAX_DURATION', self.max_duration, above=min_duration)
+        mode = gcmd.get('MODE', 'full').lower()
+        if mode not in ('full', 'quick'):
+            raise gcmd.error(f"heatsoak: unknown MODE={mode!r}, expected 'full' or 'quick'")
 
         target = self.heater.target_temp
         if target <= 0:
@@ -228,7 +259,7 @@ class Heatsoak:
         start_temp = start_status['temperature']
         signal_source = 'integral' if self.use_integral else 'pwm'
 
-        gcmd.respond_info(f"heatsoak: starting (target={target:.1f}C, start={start_temp:.1f}C, signal={signal_source}, min={min_duration:.0f}s max={max_duration:.0f}s)")
+        gcmd.respond_info(f"heatsoak: starting (target={target:.1f}C, start={start_temp:.1f}C, signal={signal_source}, mode={mode}, min={min_duration:.0f}s max={max_duration:.0f}s)")
 
         csv_file = None
         try:
@@ -264,6 +295,8 @@ class Heatsoak:
                                 or power <= self.steady_state_power * 1.5)
                     if elapsed >= min_duration and power_ok and self.detector.is_stable():
                         result = 'steady_state'
+                    elif mode == 'quick' and elapsed >= min_duration and self.detector.is_in_tail():
+                        result = 'tail_entry'
 
                 # log every sample, including the endpoint
                 det = self.detector.get_status()
@@ -301,6 +334,11 @@ class Heatsoak:
                     if csv_file is not None:
                         csv_file.write(f"# RESULT: steady_state at t={elapsed:.0f}s\n")
                     return
+                if result == 'tail_entry':
+                    gcmd.respond_info(f"heatsoak: tail entry at t={elapsed:.0f}s (power={power:.3f}), bed surface at temp")
+                    if csv_file is not None:
+                        csv_file.write(f"# RESULT: tail_entry at t={elapsed:.0f}s\n")
+                    return
         finally:
             if csv_file is not None:
                 csv_file.close()
@@ -310,8 +348,18 @@ class Heatsoak:
         "characterize steady state and suggest threshold values"
     )
     def cmd_HEATSOAK_CALIBRATE(self, gcmd):
-        duration = gcmd.get_float('DURATION', self.max_duration, above=60.)
-        target = gcmd.get_float('TARGET', self.calibrate_temp, above=0.)
+        duration = gcmd.get_float('DURATION', self.max_duration, above=0.)
+        target_raw = gcmd.get_float('TARGET', None)
+        if target_raw is not None:
+            if target_raw <= 0:
+                raise gcmd.error("TARGET must be above 0")
+            target = target_raw
+        elif self.heater.target_temp > 0:
+            target = self.heater.target_temp
+        else:
+            raise gcmd.error(
+                "HEATSOAK_CALIBRATE requires TARGET= (or set the heater first with M140)"
+            )
 
         reactor = self.printer.get_reactor()
         start_status = self.heater.get_status(reactor.monotonic())
@@ -429,16 +477,24 @@ class Heatsoak:
             gcmd.respond_info("---")
             gcmd.respond_info(f"heatsoak calibrate: analyzed tail of {len(tail)} samples (last {tail_window_s:.0f}s of run)")
             gcmd.respond_info(f"heatsoak calibrate: tail max|slope|={max_slope:.6f}, max resid={max_resid:.5f}, avg power={avg_power:.3f}")
-            if tail_still_trending:
-                gcmd.respond_info(
-                    f"heatsoak calibrate: WARNING - slope still decaying through end of run "
-                    f"(first-half max {first_half_max_slope:.6f}, second-half max {second_half_max_slope:.6f}). "
-                    f"Recommended thresholds may be too lenient. Re-run with longer DURATION."
-                )
             gcmd.respond_info(f"heatsoak calibrate: recommended slope_threshold: {rec_slope:.5f}")
             gcmd.respond_info(f"heatsoak calibrate: recommended residual_threshold: {rec_resid:.4f}")
             gcmd.respond_info(f"heatsoak calibrate: recommended relative_slope_threshold: {rec_rel_slope:.5f}")
             gcmd.respond_info(f"heatsoak calibrate: recommended steady_state_power: {avg_power:.4f}")
+            if tail_still_trending:
+                gcmd.respond_info(
+                    f"heatsoak calibrate: WARNING - bed was still settling at end of run "
+                    f"(first-half max slope {first_half_max_slope:.6f}, second-half {second_half_max_slope:.6f}). "
+                    f"Values not saved — re-run HEATSOAK_CALIBRATE with a longer DURATION, "
+                    f"then run SAVE_CONFIG."
+                )
+            else:
+                configfile = self.printer.lookup_object('configfile')
+                configfile.set('heatsoak', 'slope_threshold', f"{rec_slope:.5f}")
+                configfile.set('heatsoak', 'residual_threshold', f"{rec_resid:.4f}")
+                configfile.set('heatsoak', 'relative_slope_threshold', f"{rec_rel_slope:.5f}")
+                configfile.set('heatsoak', 'steady_state_power', f"{avg_power:.4f}")
+                gcmd.respond_info("heatsoak calibrate: run SAVE_CONFIG to persist these values")
             gcmd.respond_info("---")
         finally:
             if csv_file is not None:

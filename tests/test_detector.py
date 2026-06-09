@@ -147,3 +147,50 @@ def test_reset_clears_samples_and_status():
     d.reset()
     assert len(d.samples) == 0
     assert d.get_status() == {'sample_count': 0, 'slope': None, 'residual_std': None}
+
+
+# --- is_in_tail ---
+
+def test_in_tail_false_before_window_fills():
+    d = make_detector(window_size=4)
+    d.add_sample(0, 0.8)
+    d.add_sample(10, 0.6)
+    assert d.is_in_tail() is False
+
+
+def test_in_tail_false_during_acceleration():
+    # First half steeper than second half means no deceleration yet.
+    # slope_first=-0.02, slope_second=-0.03: slope_second < slope_first, no flip.
+    d = make_detector(window_size=4)
+    for t, p in [(0, 0.8), (10, 0.6), (20, 0.35), (30, 0.05)]:
+        d.add_sample(t, p)
+    assert d.is_in_tail() is False
+
+
+def test_in_tail_true_on_flip():
+    # First half: slope=-0.02 (clearly negative). Second half: slope=-0.005 (less steep).
+    # slope_second (-0.005) > slope_first (-0.02): flip detected.
+    d = make_detector(window_size=4)
+    for t, p in [(0, 0.8), (10, 0.6), (20, 0.5), (30, 0.45)]:
+        d.add_sample(t, p)
+    assert d.is_in_tail() is True
+
+
+def test_in_tail_latches_after_flip():
+    # Trigger the flip, then add 4 flat samples that fill the window with no flip signal.
+    d = make_detector(window_size=4)
+    for t, p in [(0, 0.8), (10, 0.6), (20, 0.5), (30, 0.45)]:
+        d.add_sample(t, p)
+    assert d.is_in_tail() is True
+    for t in range(40, 80, 10):
+        d.add_sample(t, 0.1)
+    assert d.is_in_tail() is True
+
+
+def test_reset_clears_tail_latch():
+    d = make_detector(window_size=4)
+    for t, p in [(0, 0.8), (10, 0.6), (20, 0.5), (30, 0.45)]:
+        d.add_sample(t, p)
+    assert d.is_in_tail() is True
+    d.reset()
+    assert d.is_in_tail() is False
